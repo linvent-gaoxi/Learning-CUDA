@@ -6,7 +6,7 @@
 
 namespace {
 
-constexpr int kThreadsPerBlock = 128;
+constexpr int kThreadsPerBlock = 256;
 
 __device__ inline float toFloat(float value) { return value; }
 __device__ inline float toFloat(half value) { return __half2float(value); }
@@ -27,20 +27,31 @@ __device__ half fromFloat<half>(float value) {
 template <typename T>
 __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
                               size_t rows, size_t hidden_dim, float eps) {
-  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  extern __shared__ float reduction[];
+  const size_t row = blockIdx.x;
   if (row >= rows) {
     return;
   }
 
   const size_t row_offset = row * hidden_dim;
   float sum_square = 0.0f;
-  for (size_t col = 0; col < hidden_dim; ++col) {
+  for (size_t col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
     const float value = toFloat(input[row_offset + col]);
     sum_square += value * value;
   }
 
-  const float scale = rsqrtf(sum_square / static_cast<float>(hidden_dim) + eps);
-  for (size_t col = 0; col < hidden_dim; ++col) {
+  reduction[threadIdx.x] = sum_square;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float scale =
+      rsqrtf(reduction[0] / static_cast<float>(hidden_dim) + eps);
+  for (size_t col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
     const float value = toFloat(input[row_offset + col]);
     const float gamma = toFloat(weight[col]);
     output[row_offset + col] = fromFloat<T>(value * scale * gamma);
@@ -48,11 +59,10 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
 }
 
 template <typename T>
-__global__ void attentionKernel(const T* q, const T* k, const T* v, T* output,
-                                float* accumulator, int batch_size,
-                                int target_seq_len, int src_seq_len,
-                                int query_heads, int kv_heads, int head_dim,
-                                bool is_causal) {
+__global__ void attentionSerialKernel(
+    const T* q, const T* k, const T* v, T* output, float* accumulator,
+    int batch_size, int target_seq_len, int src_seq_len, int query_heads,
+    int kv_heads, int head_dim, bool is_causal) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   const int total_rows = batch_size * target_seq_len * query_heads;
   if (row >= total_rows) {
@@ -134,6 +144,91 @@ __global__ void attentionKernel(const T* q, const T* k, const T* v, T* output,
 }
 
 template <typename T>
+__global__ void attentionParallelKernel(
+    const T* q, const T* k, const T* v, T* output, int batch_size,
+    int target_seq_len, int src_seq_len, int query_heads, int kv_heads,
+    int head_dim, bool is_causal) {
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* reduction = scores + src_seq_len;
+
+  const int row = blockIdx.x;
+  const int total_rows = batch_size * target_seq_len * query_heads;
+  if (row >= total_rows) {
+    return;
+  }
+
+  const int query_head = row % query_heads;
+  const int target_pos = (row / query_heads) % target_seq_len;
+  const int batch = row / (target_seq_len * query_heads);
+  const int heads_per_group = query_heads / kv_heads;
+  const int kv_head = query_head / heads_per_group;
+  const int valid_src_len =
+      is_causal ? min(src_seq_len, target_pos + 1) : src_seq_len;
+  const float softmax_scale = rsqrtf(static_cast<float>(head_dim));
+
+  const size_t q_offset =
+      ((static_cast<size_t>(batch) * target_seq_len + target_pos) *
+           query_heads +
+       query_head) *
+      head_dim;
+  const size_t output_offset = static_cast<size_t>(row) * head_dim;
+
+  float local_max = -FLT_MAX;
+  for (int src_pos = threadIdx.x; src_pos < valid_src_len;
+       src_pos += blockDim.x) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + src_pos) * kv_heads +
+         kv_head) *
+        head_dim;
+    float dot = 0.0f;
+    for (int dim = 0; dim < head_dim; ++dim) {
+      dot += toFloat(q[q_offset + dim]) * toFloat(k[kv_offset + dim]);
+    }
+    const float score = dot * softmax_scale;
+    scores[src_pos] = dot;
+    local_max = fmaxf(local_max, score);
+  }
+
+  reduction[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] =
+          fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  const float max_score = reduction[0];
+  if (threadIdx.x == 0) {
+    float denominator = 0.0f;
+    for (int src_pos = 0; src_pos < valid_src_len; ++src_pos) {
+      const float probability =
+          expf(scores[src_pos] * softmax_scale - max_score);
+      scores[src_pos] = probability;
+      denominator += probability;
+    }
+    reduction[0] = denominator;
+  }
+  __syncthreads();
+
+  const float denominator = reduction[0];
+  for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+    float result = 0.0f;
+    for (int src_pos = 0; src_pos < valid_src_len; ++src_pos) {
+      const size_t kv_offset =
+          ((static_cast<size_t>(batch) * src_seq_len + src_pos) * kv_heads +
+           kv_head) *
+          head_dim;
+      result += (scores[src_pos] / denominator) *
+                toFloat(v[kv_offset + dim]);
+    }
+    output[output_offset + dim] = fromFloat<T>(result);
+  }
+}
+
+template <typename T>
 void allocateAndCopy(T** device, const std::vector<T>& host) {
   const size_t bytes = host.size() * sizeof(T);
   RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(device), bytes));
@@ -178,9 +273,8 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_output),
                            h_output.size() * sizeof(T)));
 
-  const int blocks =
-      static_cast<int>((rows + kThreadsPerBlock - 1) / kThreadsPerBlock);
-  rmsNormKernel<T><<<blocks, kThreadsPerBlock>>>(
+  rmsNormKernel<T><<<static_cast<unsigned int>(rows), kThreadsPerBlock,
+                     kThreadsPerBlock * sizeof(float)>>>(
       d_input, d_weight, d_output, rows, hidden_dim, eps);
   RUNTIME_CHECK(cudaGetLastError());
   RUNTIME_CHECK(cudaDeviceSynchronize());
@@ -231,15 +325,29 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   allocateAndCopy(&d_v, h_v);
   RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_o),
                            output_size * sizeof(T)));
-  RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_accumulator),
-                           output_size * sizeof(float)));
 
   const int total_rows = batch_size * target_seq_len * query_heads;
-  const int blocks =
-      (total_rows + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  attentionKernel<T><<<blocks, kThreadsPerBlock>>>(
-      d_q, d_k, d_v, d_o, d_accumulator, batch_size, target_seq_len,
-      src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+  const size_t shared_bytes =
+      (static_cast<size_t>(src_seq_len) + kThreadsPerBlock) * sizeof(float);
+  int device = 0;
+  int max_shared_bytes = 0;
+  RUNTIME_CHECK(cudaGetDevice(&device));
+  RUNTIME_CHECK(cudaDeviceGetAttribute(
+      &max_shared_bytes, cudaDevAttrMaxSharedMemoryPerBlock, device));
+
+  if (shared_bytes <= static_cast<size_t>(max_shared_bytes)) {
+    attentionParallelKernel<T><<<total_rows, kThreadsPerBlock, shared_bytes>>>(
+        d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal);
+  } else {
+    RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_accumulator),
+                             output_size * sizeof(float)));
+    const int blocks =
+        (total_rows + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    attentionSerialKernel<T><<<blocks, kThreadsPerBlock>>>(
+        d_q, d_k, d_v, d_o, d_accumulator, batch_size, target_seq_len,
+        src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+  }
   RUNTIME_CHECK(cudaGetLastError());
   RUNTIME_CHECK(cudaDeviceSynchronize());
   RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, output_size * sizeof(T),
@@ -249,7 +357,9 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(cudaFree(d_k));
   RUNTIME_CHECK(cudaFree(d_v));
   RUNTIME_CHECK(cudaFree(d_o));
-  RUNTIME_CHECK(cudaFree(d_accumulator));
+  if (d_accumulator != nullptr) {
+    RUNTIME_CHECK(cudaFree(d_accumulator));
+  }
 }
 
 // *********************************************************************
