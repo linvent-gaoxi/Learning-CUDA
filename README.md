@@ -69,6 +69,7 @@ SKIP_RMS_NORM=1 make VERBOSE=true
 ## 验证结果
 
 - NVIDIA RTX 4060 Laptop GPU：54 项验证全部通过；
+- NVIDIA RTX 4090 D：54 项验证全部通过；
 - MetaX C500：54 项验证全部通过；
 - RMSNorm 共 13 组测试，`float` 和 `half` 均通过；
 - Attention 共 14 组测试，`float` 和 `half` 均通过；
@@ -89,6 +90,33 @@ MetaX 实现使用 `mcMalloc`、`mcMemcpy` 等 MACA Runtime API，并保持与 N
 版本相同的并行归约、稳定 Softmax、GQA 和 causal masking 逻辑。为兼容不同
 设备的单块共享内存限制，Attention 在共享内存需求超过 48 KiB 时使用串行
 兜底 Kernel。
+
+## RTX 4090 D
+
+在训练平台的 NVIDIA GeForce RTX 4090 D 上完成了独立验证：
+
+| 项目 | 配置 |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 4090 D |
+| 显存 | 24 GB |
+| NVIDIA 驱动 | 570.124.06 |
+| CUDA Toolkit | 12.8.61 |
+| 最新验证提交 | `8eb40cb` |
+
+平台的 CUDA 路径未加入默认环境变量，使用以下命令编译并运行：
+
+```bash
+PATH=/usr/local/cuda-12.8/bin:$PATH \
+LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH \
+make clean
+
+PATH=/usr/local/cuda-12.8/bin:$PATH \
+LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH \
+make VERBOSE=true
+```
+
+完整测试共 54 项，全部通过，失败数为 0，进程退出码为 0。Attention 第 14
+组测试中，`float` 平均耗时约 32.09 ms，`half` 平均耗时约 22.82 ms。
 
 ## CUDA 13.2 兼容说明
 
