@@ -1,7 +1,7 @@
 # Learning-CUDA
 
-这是我的 CUDA 算子实现与学习记录。目前已完成 NVIDIA 平台下的 RMSNorm 和
-Flash Attention，并在本地 GPU 上通过全部正确性测试。
+这是我的 GPU 算子实现与学习记录。目前已完成 NVIDIA 和 MetaX 平台下的
+RMSNorm 与 Flash Attention，并在两个平台上通过全部正确性测试。
 
 ## 完成内容
 
@@ -29,6 +29,7 @@ Flash Attention，并在本地 GPU 上通过全部正确性测试。
 
 ```text
 src/kernels.cu
+src/kernels.maca
 ```
 
 ## 本地环境
@@ -67,10 +68,27 @@ SKIP_RMS_NORM=1 make VERBOSE=true
 
 ## 验证结果
 
-- RMSNorm 共 13 组测试，`float` 和 `half` 均全部通过；
-- Attention 共 14 组测试，`float` 和 `half` 均全部通过；
+- NVIDIA RTX 4060 Laptop GPU：54 项验证全部通过；
+- MetaX C500：54 项验证全部通过；
+- RMSNorm 共 13 组测试，`float` 和 `half` 均通过；
+- Attention 共 14 组测试，`float` 和 `half` 均通过；
 - causal masking 和 GQA 测试通过；
 - 完整测试进程退出码为 `0`。
+
+## MetaX C500
+
+适配环境为 MetaX C500、MACA 3.5.3.20，使用 `mxcc` 编译器。MACA 环境配置
+完成后，在项目根目录运行：
+
+```bash
+make clean PLATFORM=metax
+make PLATFORM=metax VERBOSE=true
+```
+
+MetaX 实现使用 `mcMalloc`、`mcMemcpy` 等 MACA Runtime API，并保持与 NVIDIA
+版本相同的并行归约、稳定 Softmax、GQA 和 causal masking 逻辑。为兼容不同
+设备的单块共享内存限制，Attention 在共享内存需求超过 48 KiB 时使用串行
+兜底 Kernel。
 
 ## CUDA 13.2 兼容说明
 
